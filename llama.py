@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) Meta Platfor"bf16"ms, Inc. and affiliates.
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 
 import math
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+
 
 @dataclass
 class ModelArgs:
@@ -19,16 +20,15 @@ class ModelArgs:
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
     rope_theta: float = 500000
-
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_batch_size: int = 16
+    max_seq_len: int = 512
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, device="cpu", dtype=torch.float32):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim)).to(device=device, dtype=dtype)
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -80,18 +80,42 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, device="cpu", dtype=torch.float32):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
         self.n_local_kv_heads = self.n_kv_heads
-        self.n_rep = self.n_local_heads
-        self.head_dim = args.dim
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wq = nn.Linear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wk = nn.Linear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wv = nn.Linear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wo = nn.Linear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
 
         self.cache_k = torch.zeros(
             (
@@ -99,16 +123,20 @@ class Attention(nn.Module):
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
-            )
-        ).cuda()
+            ),
+            device=device,
+            dtype=dtype,
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
-            )
-        ).cuda()
+            ),
+            device=device,
+            dtype=dtype,
+        )
 
     def forward(
         self,
@@ -126,8 +154,8 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        # self.cache_k = self.cache_k.to(xq)
+        # self.cache_v = self.cache_v.to(xq)
 
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
@@ -164,6 +192,8 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: float | None = None,
+        device="cpu",
+        dtype=torch.float32,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -172,30 +202,48 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False, device=device, dtype=dtype)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False, device=device, dtype=dtype)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False, device=device, dtype=dtype)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(
+        self, layer_id: int, args: ModelArgs, device="cpu", dtype=torch.float32
+    ):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(
+            args,
+            device=device,
+            dtype=dtype,
+        )
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
+            device=device,
+            dtype=dtype,
         )
         self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(
+            args.dim,
+            eps=args.norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.ffn_norm = RMSNorm(
+            args.dim,
+            eps=args.norm_eps,
+            device=device,
+            dtype=dtype,
+        )
 
     def forward(
         self,
@@ -210,20 +258,43 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+    def __init__(self, params: ModelArgs, device="cpu", dtype=torch.float32):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.tok_embeddings = nn.Embedding(
+            params.vocab_size,
+            params.dim,
+            device=device,
+            dtype=dtype,
+        )
 
         self.layers = nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(
+                TransformerBlock(
+                    layer_id,
+                    params,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
 
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.norm = RMSNorm(
+            params.dim,
+            eps=params.norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.output = nn.Linear(
+            params.dim,
+            params.vocab_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
