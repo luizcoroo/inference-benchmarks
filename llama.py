@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platfor"bf16"ms, Inc. and affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 
 import math
@@ -80,60 +80,45 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, device="cpu", dtype=torch.float32):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        n_kv_heads=None,
+        device="cpu",
+        dtype=torch.float32,
+    ):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        self.n_local_heads = args.n_heads
-        self.n_local_kv_heads = self.n_kv_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+        self.n_rep = n_heads // self.n_kv_heads
+        self.head_dim = dim // n_heads
 
         self.wq = nn.Linear(
-            args.dim,
-            args.n_heads * self.head_dim,
+            dim,
+            n_heads * self.head_dim,
             bias=False,
             device=device,
             dtype=dtype,
         )
         self.wk = nn.Linear(
-            args.dim,
+            dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
             device=device,
             dtype=dtype,
         )
         self.wv = nn.Linear(
-            args.dim,
+            dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
             device=device,
             dtype=dtype,
         )
         self.wo = nn.Linear(
-            args.n_heads * self.head_dim,
-            args.dim,
+            n_heads * self.head_dim,
+            dim,
             bias=False,
-            device=device,
-            dtype=dtype,
-        )
-
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
             device=device,
             dtype=dtype,
         )
@@ -143,44 +128,40 @@ class Attention(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
+        cache: torch.Tensor,
         mask: torch.Tensor | None,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
+        cache[0, :bsz, start_pos : start_pos + seqlen] = xk
+        cache[1, :bsz, start_pos : start_pos + seqlen] = xv
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        keys = cache[0, :bsz, : start_pos + seqlen]
+        values = cache[1, :bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
             keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
         values = repeat_kv(
             values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -211,15 +192,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(
-        self, layer_id: int, args: ModelArgs, device="cpu", dtype=torch.float32
-    ):
+    def __init__(self, args: ModelArgs, device="cpu", dtype=torch.float32):
         super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
         self.attention = Attention(
-            args,
+            args.dim,
+            args.n_heads,
+            args.n_kv_heads,
             device=device,
             dtype=dtype,
         )
@@ -231,7 +209,6 @@ class TransformerBlock(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.layer_id = layer_id
         self.attention_norm = RMSNorm(
             args.dim,
             eps=args.norm_eps,
@@ -250,9 +227,12 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
+        cache,
         mask: torch.Tensor | None,
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, cache, mask
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -273,14 +253,7 @@ class Transformer(nn.Module):
 
         self.layers = nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(
-                TransformerBlock(
-                    layer_id,
-                    params,
-                    device=device,
-                    dtype=dtype,
-                )
-            )
+            self.layers.append(TransformerBlock(params, device=device, dtype=dtype))
 
         self.norm = RMSNorm(
             params.dim,
@@ -303,7 +276,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -312,9 +285,7 @@ class Transformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
-
             # When performing key-value caching, we compute the attention scores
             # only for the new sequence. Thus, the matrix of scores is of size
             # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
@@ -323,8 +294,7 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+        for layer_id, layer in enumerate(self.layers):
+            h = layer(h, start_pos, freqs_cis, cache.get_layer(layer_id), mask)
         h = self.norm(h)
-        output = self.output(h).float()
-        return output
+        return self.output(h).float()
