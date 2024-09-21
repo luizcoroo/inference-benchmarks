@@ -1,6 +1,6 @@
 return {
-	["terrasemlei2"] = {
-		host = "terrasemlei2",
+	["mylittlepony"] = {
+		host = "mylittlepony",
 		mappings = {
 			{
 				["local"] = "",
