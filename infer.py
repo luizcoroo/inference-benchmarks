@@ -1,7 +1,20 @@
+import os
+import random
+
+import numpy as np
 import torch
 
 import llama
 from contiguous_cache import ContiguousKVCache
+
+np.random.seed(0)
+random.seed(0)
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
+torch.set_printoptions(precision=10)
+
 
 print("Loading model")
 params = llama.ModelArgs(
@@ -15,7 +28,7 @@ params = llama.ModelArgs(
     norm_eps=1e-05,
     rope_theta=500000.0,
     max_batch_size=4,
-    max_seq_len=512,
+    max_seq_len=260,
 )
 
 
@@ -44,9 +57,18 @@ x = torch.randint(
     device="cuda",
 )
 
+# tensor([[ 27238,  44601,  52410,  34547,  98956],
+#         [  3967,  12672,  60779,  42006, 120551],
+#         [ 47777,  76183,  12183,  69207,  98641],
+#         [ 78284,  38301,  16350,    364,  28156]], device='cuda:0')
 for end_pos in range(min_seq_len, params.max_seq_len):
+    # start_pos = 0
+    print(end_pos - start_pos)
     y = model(x[:, start_pos:end_pos], start_pos, cache)
     x = torch.cat((x, torch.argmax(y[:, -1, :], dim=-1, keepdim=True)), 1)
     start_pos = end_pos
 
-print(x.shape)
+
+print(range(params.max_seq_len + (min_seq_len - params.max_seq_len - 1), params.max_seq_len))
+print(x[:, (min_seq_len - params.max_seq_len - 1) :])
+# print(x[:, -5:])

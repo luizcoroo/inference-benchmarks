@@ -42,41 +42,16 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    freqs_cis = freqs_cis[None, :, None, :]
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
 
 
 class Attention(nn.Module):
@@ -85,6 +60,8 @@ class Attention(nn.Module):
         dim,
         n_heads,
         n_kv_heads=None,
+        max_batch_size=4,
+        max_seq_len=260,
         device="cpu",
         dtype=torch.float32,
     ):
@@ -122,13 +99,29 @@ class Attention(nn.Module):
             device=device,
             dtype=dtype,
         )
+        self.cache_k = torch.zeros(
+            (
+                max_batch_size,
+                max_seq_len,
+                self.n_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                max_batch_size,
+                max_seq_len,
+                self.n_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
-        cache: torch.Tensor,
+        cache,
         mask: torch.Tensor | None,
     ):
         bsz, seqlen, _ = x.shape
@@ -140,19 +133,27 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        cache[0, :bsz, start_pos : start_pos + seqlen] = xk
-        cache[1, :bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
 
-        keys = cache[0, :bsz, : start_pos + seqlen]
-        values = cache[1, :bsz, : start_pos + seqlen]
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        # k_cache, v_cache = cache.get_kv_cache()
+        # k_cache[:bsz, start_pos : start_pos + seqlen] = xk
+        # v_cache[:bsz, start_pos : start_pos + seqlen] = xv
+        #
+        # keys = k_cache[:bsz, : start_pos + seqlen]
+        # values = v_cache[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_heads, head_dim)
-        values = repeat_kv(
-            values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_heads, head_dim)
+        # keys = xk
+        # values = xv
+        keys = torch.repeat_interleave(keys, dim=-2, repeats=self.n_rep)
+        values = torch.repeat_interleave(values, dim=-2, repeats=self.n_rep)
 
         xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
@@ -198,6 +199,8 @@ class TransformerBlock(nn.Module):
             args.dim,
             args.n_heads,
             args.n_kv_heads,
+            args.max_batch_size,
+            args.max_seq_len,
             device=device,
             dtype=dtype,
         )

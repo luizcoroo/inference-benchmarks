@@ -3,6 +3,14 @@ import torch
 from llama import ModelArgs
 
 
+class ContiguousKVCacheView:
+    def __init__(self, kv_cache):
+        self.k_cache = kv_cache[0]
+        self.v_cache = kv_cache[1]
+
+    def get_kv_cache(self):
+        return self.k_cache, self.v_cache
+
 class ContiguousKVCache:
     def __init__(
         self,
@@ -25,4 +33,4 @@ class ContiguousKVCache:
         )
 
     def get_layer(self, layer_id: int):
-        return self.kv_cache[layer_id]
+        return ContiguousKVCacheView(self.kv_cache[layer_id])
