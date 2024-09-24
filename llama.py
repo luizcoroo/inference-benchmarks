@@ -25,10 +25,10 @@ class ModelArgs:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, device="cpu", dtype=torch.float32):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim)).to(device=device, dtype=dtype)
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -62,8 +62,6 @@ class Attention(nn.Module):
         n_kv_heads=None,
         max_batch_size=4,
         max_seq_len=260,
-        device="cpu",
-        dtype=torch.float32,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -71,59 +69,12 @@ class Attention(nn.Module):
         self.n_rep = n_heads // self.n_kv_heads
         self.head_dim = dim // n_heads
 
-        self.wq = nn.Linear(
-            dim,
-            n_heads * self.head_dim,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.wk = nn.Linear(
-            dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.wv = nn.Linear(
-            dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.wo = nn.Linear(
-            n_heads * self.head_dim,
-            dim,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.cache_k = torch.zeros(
-            (
-                max_batch_size,
-                max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (
-                max_batch_size,
-                max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
+        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        cache,
-        mask: torch.Tensor | None,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, mask=None, cache=None):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -133,38 +84,20 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
-
-        # k_cache, v_cache = cache.get_kv_cache()
-        # k_cache[:bsz, start_pos : start_pos + seqlen] = xk
-        # v_cache[:bsz, start_pos : start_pos + seqlen] = xv
-        #
-        # keys = k_cache[:bsz, : start_pos + seqlen]
-        # values = v_cache[:bsz, : start_pos + seqlen]
+        if cache is not None:
+            xk, xv = cache.update_kv(xk, xv)
 
         # repeat k/v heads if n_kv_heads < n_heads
-        # keys = xk
-        # values = xv
-        keys = torch.repeat_interleave(keys, dim=-2, repeats=self.n_rep)
-        values = torch.repeat_interleave(values, dim=-2, repeats=self.n_rep)
+        xk = torch.repeat_interleave(xk, dim=-2, repeats=self.n_rep)
+        xv = torch.repeat_interleave(xv, dim=-2, repeats=self.n_rep)
+        xq, xk, xv = xq.transpose(1, 2), xk.transpose(1, 2), xv.transpose(1, 2)
 
-        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+        output = torch.matmul(scores, xv).transpose(1, 2).contiguous()
+        return self.wo(output.view(bsz, seqlen, -1))
 
 
 class FeedForward(nn.Module):
@@ -174,26 +107,23 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: float | None = None,
-        device="cpu",
-        dtype=torch.float32,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False, device=device, dtype=dtype)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False, device=device, dtype=dtype)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False, device=device, dtype=dtype)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, device="cpu", dtype=torch.float32):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.attention = Attention(
             args.dim,
@@ -201,76 +131,36 @@ class TransformerBlock(nn.Module):
             args.n_kv_heads,
             args.max_batch_size,
             args.max_seq_len,
-            device=device,
-            dtype=dtype,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
-            device=device,
-            dtype=dtype,
         )
-        self.attention_norm = RMSNorm(
-            args.dim,
-            eps=args.norm_eps,
-            device=device,
-            dtype=dtype,
-        )
-        self.ffn_norm = RMSNorm(
-            args.dim,
-            eps=args.norm_eps,
-            device=device,
-            dtype=dtype,
-        )
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        cache,
-        mask: torch.Tensor | None,
-    ):
-        h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, cache, mask
-        )
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, mask=None, cache=None):
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, cache)
+        return h + self.feed_forward(self.ffn_norm(h))
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs, device="cpu", dtype=torch.float32):
+    def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = nn.Embedding(
-            params.vocab_size,
-            params.dim,
-            device=device,
-            dtype=dtype,
-        )
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
 
         self.layers = nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(params, device=device, dtype=dtype))
+            self.layers.append(TransformerBlock(params))
 
-        self.norm = RMSNorm(
-            params.dim,
-            eps=params.norm_eps,
-            device=device,
-            dtype=dtype,
-        )
-        self.output = nn.Linear(
-            params.dim,
-            params.vocab_size,
-            bias=False,
-            dtype=dtype,
-            device=device,
-        )
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
@@ -279,7 +169,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int, cache):
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache=None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -289,15 +179,10 @@ class Transformer(nn.Module):
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
 
         for layer_id, layer in enumerate(self.layers):
-            h = layer(h, start_pos, freqs_cis, cache.get_layer(layer_id), mask)
-        h = self.norm(h)
-        return self.output(h).float()
+            cache_layer = None
+            if cache is not None:
+                cache_layer = cache.get_layer(layer_id, start_pos)
+            h = layer(h, freqs_cis, mask, cache_layer)
+        return self.output(self.norm(h)).float()

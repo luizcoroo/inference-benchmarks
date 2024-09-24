@@ -4,33 +4,32 @@ from llama import ModelArgs
 
 
 class ContiguousKVCacheView:
-    def __init__(self, kv_cache):
-        self.k_cache = kv_cache[0]
-        self.v_cache = kv_cache[1]
+    def __init__(self, kv_cache, start_pos):
+        self.kv_cache = kv_cache
+        self.start_pos = start_pos
 
-    def get_kv_cache(self):
-        return self.k_cache, self.v_cache
-
-class ContiguousKVCache:
-    def __init__(
-        self,
-        params: ModelArgs,
-        device: str = "cpu",
-        dtype: torch.dtype = torch.float32,
-    ):
-        head_dim = params.dim // params.n_heads
-        self.kv_cache = torch.zeros(
-            (
-                params.n_layers,
-                2,
-                params.max_batch_size,
-                params.max_seq_len,
-                params.n_kv_heads,
-                head_dim,
-            ),
-            device=device,
-            dtype=dtype,
+    def update_kv(self, xk, xv):
+        bsz, seqlen, _, _ = xk.shape
+        self.kv_cache[0, :bsz, self.start_pos : self.start_pos + seqlen] = xk
+        self.kv_cache[1, :bsz, self.start_pos : self.start_pos + seqlen] = xv
+        return (
+            self.kv_cache[0, :bsz, : self.start_pos + seqlen],
+            self.kv_cache[1, :bsz, : self.start_pos + seqlen],
         )
 
-    def get_layer(self, layer_id: int):
-        return ContiguousKVCacheView(self.kv_cache[layer_id])
+
+class ContiguousKVCache:
+    def __init__(self, args: ModelArgs):
+        self.kv_cache = torch.zeros(
+            (
+                args.n_layers,
+                2,
+                args.max_batch_size,
+                args.max_seq_len,
+                args.n_heads if args.n_kv_heads is None else args.n_kv_heads,
+                args.dim // args.n_heads,
+            )
+        )
+
+    def get_layer(self, layer_id: int, start_pos: int):
+        return ContiguousKVCacheView(self.kv_cache[layer_id], start_pos)
