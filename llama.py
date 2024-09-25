@@ -169,10 +169,12 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int, cache=None):
+    def forward(self, tokens: torch.Tensor, cache=None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
+
+        start_pos = cache.start_pos if cache is not None else 0
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
@@ -181,8 +183,6 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=1)
 
         for layer_id, layer in enumerate(self.layers):
-            cache_layer = None
-            if cache is not None:
-                cache_layer = cache.get_layer(layer_id, start_pos)
+            cache_layer = cache.get_layer(layer_id) if cache is not None else None
             h = layer(h, freqs_cis, mask, cache_layer)
         return self.output(self.norm(h)).float()
