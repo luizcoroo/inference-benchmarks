@@ -169,7 +169,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, cache=None):
+    def forward(self, tokens: torch.Tensor, cache=None, return_hidden_states=False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -182,7 +182,15 @@ class Transformer(nn.Module):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
 
+        hidden_states = []
         for layer_id, layer in enumerate(self.layers):
             cache_layer = cache.get_layer(layer_id) if cache is not None else None
             h = layer(h, freqs_cis, mask, cache_layer)
-        return self.output(self.norm(h)).float()
+            if return_hidden_states:
+                hidden_states.append(h.float())
+
+        output = {"logits": self.output(self.norm(h)).float()}
+        if return_hidden_states:
+            output["hidden_states"] = hidden_states
+
+        return output

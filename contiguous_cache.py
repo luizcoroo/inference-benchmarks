@@ -21,18 +21,19 @@ class ContiguousKVCacheView:
 
 
 class ContiguousKVCache:
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, max_batch_size, max_seq_len, dtype):
         self.start_pos = 0
         self.last_seqlen = [0]
         self.kv_cache = torch.zeros(
             (
                 args.n_layers,
                 2,
-                args.max_batch_size,
-                args.max_seq_len,
+                max_batch_size,
+                max_seq_len,
                 args.n_heads if args.n_kv_heads is None else args.n_kv_heads,
                 args.dim // args.n_heads,
-            )
+            ),
+            dtype=dtype,
         )
 
     def get_layer(self, layer_id: int):

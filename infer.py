@@ -32,8 +32,6 @@ params = llama.ModelArgs(
     multiple_of=1024,
     norm_eps=1e-05,
     rope_theta=500000.0,
-    max_batch_size=max_batch_size,
-    max_seq_len=max_seq_len,
 )
 
 
@@ -62,12 +60,12 @@ for _ in tqdm(range(max_iterations)):
     x2 = x1.clone()
 
     for _ in tqdm(range(min_seq_len, max_seq_len), leave=False):
-        y = model(x1)
+        y = model(x1)["logits"]
         x1 = torch.cat((x1, torch.argmax(y[:, -1, :], dim=-1, keepdim=True)), 1)
 
-    cache, next_input = ContiguousKVCache(params), x2
+    cache, next_input = ContiguousKVCache(params, max_batch_size, max_seq_len), x2
     for _ in tqdm(range(min_seq_len, max_seq_len), leave=False):
-        y = model(next_input, cache)
+        y = model(next_input, cache)["logits"]
         next_input = torch.argmax(y[:, -1, :], dim=-1, keepdim=True)
         x2 = torch.cat((x2, next_input), 1)
         cache.update()
